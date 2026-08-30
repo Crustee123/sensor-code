@@ -1,0 +1,83 @@
+what does this code do exactly
+#include <ESP8266WiFi.h>
+
+#define TRIG D1
+#define ECHO D2
+
+const char* ssid = "Desierto_2.4G";
+const char* password = "11122931";
+
+WiFiServer server(80);
+
+long duration;
+float distance;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConnected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  server.begin();
+}
+
+void loop() {
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  // Measure distance
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+
+  duration = pulseIn(ECHO, HIGH);
+  distance = duration * 0.034 / 2;
+
+  // Wait for client request
+  while (!client.available()) {
+    delay(1);
+  }
+  client.readStringUntil('\r');
+
+  // Send webpage
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+
+  client.println(F("<!DOCTYPE HTML>"));
+  client.println(F("<html>"));
+  client.println(F("<head>"));
+  client.println(F("<meta name='viewport' content='width=device-width, initial-scale=1'>"));
+  client.println(F("<meta http-equiv='refresh' content='2'>"));
+  client.println(F("<style>body{font-family:Arial;text-align:center;margin-top:50px;} .value{font-size:40px;color:blue;}</style>"));
+  client.println(F("</head>"));
+  client.println(F("<body>"));
+
+  client.println(F("<h1>Flood Sensor</h1>"));
+  client.println(F("<p>Distance:</p>"));
+  client.print(F("<p class='value'>"));
+  client.print(distance);
+  client.println(F(" cm</p>"));
+
+  client.println(F("</body>"));
+  client.println(F("</html>"));
+
+  client.stop();
+}
