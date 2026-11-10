@@ -218,35 +218,39 @@ unsigned long getTimestamp() {
 
 // ================= FIREBASE =================
 
+
 void uploadFirebase() {
 
   if (WiFi.status() != WL_CONNECTED) {
-
     Serial.println("WiFi Disconnected!");
     return;
   }
 
+  // ================= HTTPS CLIENT =================
+
   WiFiClientSecure client;
   client.setInsecure();
 
+  // ================= CURRENT DATA =================
+
   HTTPClient http;
 
-  String currentPath =
-    "/flood_details/" + String(sensorID) + ".json";
-
   String currentURL =
-    String(firebaseURL) + currentPath;
+    String(firebaseURL) +
+    "/flood_details/" +
+    String(sensorID) +
+    ".json";
 
   Serial.println();
   Serial.println("Uploading Current Data...");
 
   if (!http.begin(client, currentURL)) {
-
-    Serial.println("HTTP Begin Failed!");
+    Serial.println("Current HTTP Begin Failed!");
     return;
   }
 
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000);
 
   String json = "{";
 
@@ -276,30 +280,41 @@ void uploadFirebase() {
 
   http.end();
 
-  // ================= HISTORY =================
+  yield();
 
-  WiFiClientSecure historyClient;
-  historyClient.setInsecure();
+  // ================= WATER LEVEL HISTORY =================
 
   HTTPClient historyHTTP;
 
-  String historyPath =
-    "/flood_history/" + String(sensorID) + ".json";
-
   String historyURL =
-    String(firebaseURL) + historyPath;
+    String(firebaseURL) +
+    "/water_level_history.json";
 
-  Serial.println("Uploading History...");
+  Serial.println();
+  Serial.println("Uploading Water Level History...");
 
-  if (!historyHTTP.begin(historyClient, historyURL)) {
-
+  if (!historyHTTP.begin(client, historyURL)) {
     Serial.println("History HTTP Begin Failed!");
     return;
   }
 
   historyHTTP.addHeader("Content-Type", "application/json");
+  historyHTTP.setTimeout(15000);
 
-  int historyResponse = historyHTTP.POST(json);
+  String historyJSON = "{";
+
+  historyJSON += "\"sensor_id\":\"" + String(sensorID) + "\",";
+  historyJSON += "\"date\":\"" + getDate() + "\",";
+  historyJSON += "\"time\":\"" + getTime() + "\",";
+  historyJSON += "\"timestamp\":" + String(getTimestamp()) + ",";
+  historyJSON += "\"water_level\":" + String(waterHeight, 2);
+
+  historyJSON += "}";
+
+  Serial.println("History JSON:");
+  Serial.println(historyJSON);
+
+  int historyResponse = historyHTTP.POST(historyJSON);
 
   Serial.print("History Response: ");
   Serial.println(historyResponse);
@@ -307,6 +322,8 @@ void uploadFirebase() {
   if (historyResponse == 200) {
 
     Serial.println("History Saved Successfully!");
+
+    Serial.print("Firebase Response: ");
     Serial.println(historyHTTP.getString());
 
   }
@@ -314,13 +331,20 @@ void uploadFirebase() {
 
     Serial.println("History Upload Failed!");
 
-    if (historyResponse < 0) {
-      Serial.println(historyHTTP.errorToString(historyResponse));
+    if (historyResponse > 0) {
+      Serial.println(historyHTTP.getString());
+    }
+    else {
+      Serial.println(
+        historyHTTP.errorToString(historyResponse)
+      );
     }
 
   }
 
   historyHTTP.end();
+
+  yield();
 }
 
 // ================= WEB DASHBOARD =================
