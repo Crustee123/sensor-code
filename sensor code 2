@@ -1,0 +1,446 @@
+
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
+
+// ================= SENSOR =================
+#define TRIG D1
+#define ECHO D2
+
+// CHANGE THIS TO YOUR ACTUAL SENSOR-TO-BOTTOM DISTANCE
+const float SENSOR_HEIGHT = 100.0;
+
+// ================= WIFI =================
+
+const char* ssid = "Desierto 2.4G";
+const char* password = "11122931";
+
+// ================= FIREBASE =================
+
+const char* firebaseURL =
+  "https://floodwatch-192e1-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+const char* sensorID = "sensor2";
+
+// ================= SETTINGS =================
+
+const unsigned long uploadInterval = 2000;
+const unsigned long sensorInterval = 100;
+
+const char* location = "Bambang purok 4, Bocaue Bulacan";
+
+// ================= SERVER =================
+
+WiFiServer server(80);
+
+// ================= VARIABLES =================
+
+float distance = 0;
+float waterHeight = 0;
+
+String floodType = "No Flood";
+
+unsigned long previousUpload = 0;
+unsigned long previousSensorRead = 0;
+
+bool sensorValid = false;
+
+// ================= SETUP =================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+
+  digitalWrite(TRIG, LOW);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       FLOODWATCH ESP8266       ");
+  Serial.println("================================");
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected!");
+
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  configTime(28800, 0, "pool.ntp.org", "time.google.com");
+
+  Serial.print("Syncing time");
+
+  time_t now = time(nullptr);
+
+  while (now < 100000) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+
+  Serial.println();
+  Serial.println("Time synchronized!");
+
+  server.begin();
+
+  Serial.println("Web Server Started!");
+  Serial.println("Firebase Ready!");
+  Serial.println("================================");
+}
+
+// ================= SENSOR =================
+
+bool readSensor() {
+
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(5);
+
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG, LOW);
+
+  // 35ms timeout = approximately 6 meters
+  unsigned long duration = pulseIn(ECHO, HIGH, 35000);
+
+  if (duration == 0) {
+
+    Serial.println("Sensor Timeout! Keeping previous reading.");
+
+    return false;
+  }
+
+  float newDistance = duration * 0.0343 / 2.0;
+
+  // Reject impossible readings
+  if (newDistance <= 2 || newDistance > SENSOR_HEIGHT) {
+
+    Serial.println("Invalid Sensor Reading!");
+
+    return false;
+  }
+
+  distance = newDistance;
+
+  // Calculate actual water height
+  waterHeight = SENSOR_HEIGHT - distance;
+
+  Serial.print("Distance: ");
+  Serial.print(distance, 2);
+  Serial.println(" cm");
+
+  Serial.print("Water Level: ");
+  Serial.print(waterHeight, 2);
+  Serial.println(" cm");
+
+  return true;
+}
+
+// ================= FLOOD CLASSIFICATION =================
+
+void classifyFlood() {
+
+  if (waterHeight >= 70) {
+
+    floodType = "No Flood";
+
+  }
+  else if (waterHeight >= 60) {
+
+    floodType = "Flooding";
+
+  }
+  else if (waterHeight >= 40) {
+
+    floodType = "Light Flooding";
+
+  }
+  else {
+
+    floodType = "Heavy Flooding";
+
+  }
+
+  Serial.print("Flood Type: ");
+  Serial.println(floodType);
+}
+
+// ================= DATE =================
+
+String getDate() {
+
+  time_t now = time(nullptr);
+
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
+  char buffer[30];
+
+  strftime(buffer, sizeof(buffer), "%B %d, %Y", &timeinfo);
+
+  return String(buffer);
+}
+
+// ================= TIME =================
+
+String getTime() {
+
+  time_t now = time(nullptr);
+
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
+  char buffer[20];
+
+  strftime(buffer, sizeof(buffer), "%I:%M:%S %p", &timeinfo);
+
+  return String(buffer);
+}
+
+// ================= TIMESTAMP =================
+
+unsigned long getTimestamp() {
+
+  return (unsigned long)time(nullptr);
+}
+
+// ================= FIREBASE =================
+
+
+void uploadFirebase() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi Disconnected!");
+    return;
+  }
+
+  // ================= HTTPS CLIENT =================
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  // ================= CURRENT DATA =================
+
+  HTTPClient http;
+
+  String currentURL =
+    String(firebaseURL) +
+    "/flood_details/" +
+    String(sensorID) +
+    ".json";
+
+  Serial.println();
+  Serial.println("Uploading Current Data...");
+
+  if (!http.begin(client, currentURL)) {
+    Serial.println("Current HTTP Begin Failed!");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000);
+
+  String json = "{";
+
+  json += "\"date\":\"" + getDate() + "\",";
+  json += "\"time\":\"" + getTime() + "\",";
+  json += "\"timestamp\":" + String(getTimestamp()) + ",";
+  json += "\"flood_type\":\"" + floodType + "\",";
+  json += "\"location\":\"" + String(location) + "\",";
+  json += "\"water_level\":" + String(waterHeight, 2);
+
+  json += "}";
+
+  Serial.println(json);
+
+  int response = http.PUT(json);
+
+  Serial.print("Current Data Response: ");
+  Serial.println(response);
+
+  if (response == 200) {
+    Serial.println("Current Data Updated!");
+  }
+  else {
+    Serial.println("Current Data Upload Failed!");
+    Serial.println(http.errorToString(response));
+  }
+
+  http.end();
+
+  yield();
+
+  // ================= WATER LEVEL HISTORY =================
+
+  HTTPClient historyHTTP;
+
+  String historyURL =
+    String(firebaseURL) +
+    "/water_level_history.json";
+
+  Serial.println();
+  Serial.println("Uploading Water Level History...");
+
+  if (!historyHTTP.begin(client, historyURL)) {
+    Serial.println("History HTTP Begin Failed!");
+    return;
+  }
+
+  historyHTTP.addHeader("Content-Type", "application/json");
+  historyHTTP.setTimeout(15000);
+
+  String historyJSON = "{";
+
+  historyJSON += "\"sensor_id\":\"" + String(sensorID) + "\",";
+  historyJSON += "\"date\":\"" + getDate() + "\",";
+  historyJSON += "\"time\":\"" + getTime() + "\",";
+  historyJSON += "\"timestamp\":" + String(getTimestamp()) + ",";
+  historyJSON += "\"water_level\":" + String(waterHeight, 2);
+
+  historyJSON += "}";
+
+  Serial.println("History JSON:");
+  Serial.println(historyJSON);
+
+  int historyResponse = historyHTTP.POST(historyJSON);
+
+  Serial.print("History Response: ");
+  Serial.println(historyResponse);
+
+  if (historyResponse == 200) {
+
+    Serial.println("History Saved Successfully!");
+
+    Serial.print("Firebase Response: ");
+    Serial.println(historyHTTP.getString());
+
+  }
+  else {
+
+    Serial.println("History Upload Failed!");
+
+    if (historyResponse > 0) {
+      Serial.println(historyHTTP.getString());
+    }
+    else {
+      Serial.println(
+        historyHTTP.errorToString(historyResponse)
+      );
+    }
+
+  }
+
+  historyHTTP.end();
+
+  yield();
+}
+
+// ================= WEB DASHBOARD =================
+
+void handleWebServer() {
+
+  WiFiClient client = server.available();
+
+  if (!client) {
+    return;
+  }
+
+  unsigned long timeout = millis();
+
+  while (client.connected() && !client.available()) {
+
+    delay(1);
+
+    if (millis() - timeout > 2000) {
+      client.stop();
+      return;
+    }
+  }
+
+  client.readStringUntil('\r');
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+
+  client.println("<!DOCTYPE html>");
+  client.println("<html>");
+  client.println("<head>");
+
+  client.println(
+    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+  );
+
+  client.println("<meta http-equiv='refresh' content='2'>");
+  client.println("<title>FloodWatch</title>");
+  client.println("</head>");
+
+  client.println(
+    "<body style='text-align:center;font-family:Arial;background:#0B0F5B;color:white;'>"
+  );
+
+  client.println("<h1>FloodWatch Sensor</h1>");
+
+  client.print("<h2>Distance: ");
+  client.print(distance, 2);
+  client.println(" cm</h2>");
+
+  client.print("<h2>Water Level: ");
+  client.print(waterHeight, 2);
+  client.println(" cm</h2>");
+
+  client.print("<h2>Flood Type: ");
+  client.print(floodType);
+  client.println("</h2>");
+
+  client.println("</body>");
+  client.println("</html>");
+
+  client.stop();
+}
+
+// ================= LOOP =================
+
+void loop() {
+
+  // Read sensor at controlled intervals
+  if (millis() - previousSensorRead >= sensorInterval) {
+
+    previousSensorRead = millis();
+
+    sensorValid = readSensor();
+
+    if (sensorValid) {
+      classifyFlood();
+    }
+  }
+
+  // Upload every 5 seconds
+  if (millis() - previousUpload >= uploadInterval) {
+
+    previousUpload = millis();
+
+    if (sensorValid) {
+      uploadFirebase();
+    }
+    else {
+      Serial.println("Upload Skipped: No Valid Sensor Reading.");
+    }
+  }
+
+  handleWebServer();
+
+  yield();
+}
