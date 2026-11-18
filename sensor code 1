@@ -10,12 +10,12 @@
 #define ECHO D2
 
 // CHANGE THIS TO YOUR ACTUAL SENSOR-TO-BOTTOM DISTANCE
-const float SENSOR_HEIGHT = 100.0;
+const float SENSOR_HEIGHT = 50.0;
 
 // ================= WIFI =================
 
-const char* ssid = "Desierto 2.4G";
-const char* password = "11122931";
+const char* ssid = "Galaxy A34 5G F2F3";
+const char* password = "11111111";
 
 // ================= FIREBASE =================
 
@@ -152,19 +152,19 @@ bool readSensor() {
 
 void classifyFlood() {
 
-  if (waterHeight >= 70) {
+  if (waterHeight <= 10) {
 
     floodType = "No Flood";
 
   }
-  else if (waterHeight >= 60) {
-
-    floodType = "Flooding";
-
-  }
-  else if (waterHeight >= 40) {
+  else if (waterHeight <= 20) {
 
     floodType = "Light Flooding";
+
+  }
+  else if (waterHeight <=35) {
+
+    floodType = "Flooding";
 
   }
   else {
