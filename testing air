@@ -1,0 +1,983 @@
+
+#include <ESP8266WiFi.h>
+#include <SoftwareSerial.h>
+
+// ==================================================
+// FLOODWATCH - ESP8266 + AJ-SR04M + AIR780E + FIREBASE
+// ==================================================
+
+// ================= SENSOR =================
+
+#define TRIG D1
+#define ECHO D2
+
+const float SENSOR_HEIGHT = 50.0;
+
+// ================= AIR780E =================
+
+// ESP8266 D5 receives AIR780E TX
+// ESP8266 D6 sends to AIR780E RX
+
+SoftwareSerial airSerial(D5, D6);
+
+const unsigned long MODEM_BAUD = 9600;
+
+// ================= FIREBASE =================
+
+const char* firebaseURL =
+  "https://floodwatch-192e1-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+const char* sensorID = "sensor1";
+
+const char* location =
+  "Bambang purok 4, Bocaue Bulacan";
+
+// ================= SETTINGS =================
+
+const unsigned long uploadInterval = 2000;
+const unsigned long sensorInterval = 100;
+
+const unsigned long timeSyncInterval = 3600000;
+
+// ================= LOCAL DASHBOARD =================
+
+WiFiServer server(80);
+
+const char* apName = "FloodWatch-Sensor1";
+const char* apPassword = "floodwatch123";
+
+// ================= SENSOR VARIABLES =================
+
+float distance = 0;
+float waterHeight = 0;
+
+String floodType = "No Flood";
+
+unsigned long previousUpload = 0;
+unsigned long previousSensorRead = 0;
+unsigned long previousTimeSync = 0;
+
+bool sensorValid = false;
+bool timeValid = false;
+
+// ================= TIME VARIABLES =================
+
+String currentDate = "Time unavailable";
+String currentTime = "Time unavailable";
+
+uint32_t currentTimestamp = 0;
+
+// ==================================================
+// MODEM RESPONSE READER
+// ==================================================
+
+bool waitForToken(
+  String token,
+  unsigned long timeout,
+  String &response
+) {
+
+  response = "";
+
+  unsigned long start = millis();
+
+  while (millis() - start < timeout) {
+
+    while (airSerial.available()) {
+
+      char c = airSerial.read();
+
+      Serial.write(c);
+
+      response += c;
+
+      if (response.indexOf(token) >= 0) {
+        return true;
+      }
+
+      if (response.length() > 2000) {
+        response.remove(0, 1000);
+      }
+    }
+
+    yield();
+  }
+
+  return false;
+}
+
+// ==================================================
+// SEND AT COMMAND
+// ==================================================
+
+bool sendAT(
+  String command,
+  unsigned long timeout = 8000,
+  String *output = nullptr
+) {
+
+  Serial.println();
+  Serial.println(">> " + command);
+
+  airSerial.println(command);
+
+  String response;
+
+  bool received = waitForToken("OK", timeout, response);
+
+  if (output != nullptr) {
+    *output = response;
+  }
+
+  if (!received ||
+      response.indexOf("ERROR") >= 0) {
+
+    Serial.println("\nAT COMMAND FAILED!");
+
+    return false;
+  }
+
+  return true;
+}
+
+// ==================================================
+// MODEM TIME SYNCHRONIZATION
+// ==================================================
+
+int64_t daysFromCivil(int year, unsigned month, unsigned day) {
+
+  year -= (month <= 2);
+
+  int era = (year >= 0 ? year : year - 399) / 400;
+
+  unsigned yearOfEra = year - era * 400;
+
+  int adjustedMonth =
+    (int)month + (month > 2 ? -3 : 9);
+
+  unsigned dayOfYear =
+    (153 * adjustedMonth + 2) / 5 + day - 1;
+
+  unsigned dayOfEra =
+    yearOfEra * 365 +
+    yearOfEra / 4 -
+    yearOfEra / 100 +
+    dayOfYear;
+
+  return (int64_t)era * 146097 +
+         (int64_t)dayOfEra - 719468;
+}
+
+// --------------------------------------------------
+
+bool readModemClock() {
+
+  String response;
+
+  if (!sendAT("AT+CCLK?", 5000, &response)) {
+    return false;
+  }
+
+  int position = response.indexOf("+CCLK:");
+
+  if (position < 0) {
+    Serial.println("Clock response missing!");
+    return false;
+  }
+
+  int quoteStart = response.indexOf('"', position);
+  int quoteEnd = response.indexOf('"', quoteStart + 1);
+
+  if (quoteStart < 0 || quoteEnd < 0) {
+    return false;
+  }
+
+  String clock = response.substring(
+    quoteStart + 1,
+    quoteEnd
+  );
+
+  if (clock.length() < 20) {
+    return false;
+  }
+
+  int year = 2000 + clock.substring(0, 2).toInt();
+
+  int month = clock.substring(3, 5).toInt();
+  int day = clock.substring(6, 8).toInt();
+
+  int hour = clock.substring(9, 11).toInt();
+  int minute = clock.substring(12, 14).toInt();
+  int second = clock.substring(15, 17).toInt();
+
+  int timezoneQuarter =
+    clock.substring(18, 20).toInt();
+
+  if (clock.charAt(17) == '-') {
+    timezoneQuarter = -timezoneQuarter;
+  }
+
+  if (year < 2024 ||
+      month < 1 || month > 12 ||
+      day < 1 || day > 31 ||
+      hour > 23 ||
+      minute > 59 ||
+      second > 59) {
+
+    Serial.println("Invalid modem clock!");
+    return false;
+  }
+
+  const char* months[] = {
+    "January", "February", "March",
+    "April", "May", "June",
+    "July", "August", "September",
+    "October", "November", "December"
+  };
+
+  currentDate =
+    String(months[month - 1]) + " " +
+    String(day) + ", " +
+    String(year);
+
+  char timeBuffer[20];
+
+  int displayHour = hour % 12;
+
+  if (displayHour == 0) {
+    displayHour = 12;
+  }
+
+  sprintf(
+    timeBuffer,
+    "%02d:%02d:%02d %s",
+    displayHour,
+    minute,
+    second,
+    hour >= 12 ? "PM" : "AM"
+  );
+
+  currentTime = String(timeBuffer);
+
+  int64_t epoch =
+    daysFromCivil(year, month, day) * 86400LL +
+    hour * 3600LL +
+    minute * 60LL +
+    second -
+    timezoneQuarter * 900LL;
+
+  currentTimestamp = (uint32_t)epoch;
+
+  timeValid = true;
+
+  Serial.println();
+  Serial.println("MODEM TIME UPDATED");
+
+  Serial.println(currentDate);
+  Serial.println(currentTime);
+
+  Serial.print("Timestamp: ");
+  Serial.println(currentTimestamp);
+
+  return true;
+}
+
+// --------------------------------------------------
+
+bool syncNetworkTime() {
+
+  Serial.println();
+  Serial.println("========== NETWORK TIME SYNC ==========");
+
+  if (!sendAT("AT+CNTPCID=1")) {
+    return false;
+  }
+
+  // Philippines = UTC+8 = 32 quarter-hours
+
+  if (!sendAT(
+    "AT+CNTP=\"pool.ntp.org\",32"
+  )) {
+    return false;
+  }
+
+  Serial.println("\nRequesting NTP synchronization...");
+
+  airSerial.println("AT+CNTP");
+
+  String response;
+
+  bool commandOK = waitForToken(
+    "OK",
+    10000,
+    response
+  );
+
+  if (!commandOK) {
+    Serial.println("NTP command failed.");
+    return false;
+  }
+
+  String ntpResponse;
+
+  bool synced = waitForToken(
+    "+CNTP:",
+    30000,
+    ntpResponse
+  );
+
+  if (!synced) {
+    Serial.println("NTP response timed out.");
+    return false;
+  }
+
+  if (ntpResponse.indexOf("+CNTP: 1") < 0) {
+    Serial.println("NTP synchronization unsuccessful.");
+    return false;
+  }
+
+  return readModemClock();
+}
+
+// ==================================================
+// SENSOR
+// ==================================================
+
+bool readSensor() {
+
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(5);
+
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG, LOW);
+
+  unsigned long duration =
+    pulseIn(ECHO, HIGH, 35000);
+
+  if (duration == 0) {
+
+    Serial.println("Sensor Timeout!");
+
+    return false;
+  }
+
+  float newDistance =
+    duration * 0.0343 / 2.0;
+
+  if (newDistance <= 2 ||
+      newDistance > SENSOR_HEIGHT) {
+
+    Serial.println("Invalid Sensor Reading!");
+
+    return false;
+  }
+
+  distance = newDistance;
+
+  waterHeight = SENSOR_HEIGHT - distance;
+
+  Serial.println();
+  Serial.println("========== SENSOR READING ==========");
+
+  Serial.print("Distance: ");
+  Serial.print(distance, 2);
+  Serial.println(" cm");
+
+  Serial.print("Water Level: ");
+  Serial.print(waterHeight, 2);
+  Serial.println(" cm");
+
+  return true;
+}
+
+// ==================================================
+// FLOOD CLASSIFICATION
+// ==================================================
+
+void classifyFlood() {
+
+  if (waterHeight <= 10) {
+
+    floodType = "No Flood";
+
+  }
+  else if (waterHeight <= 20) {
+
+    floodType = "Light Flooding";
+
+  }
+  else if (waterHeight <= 35) {
+
+    floodType = "Flooding";
+
+  }
+  else {
+
+    floodType = "Heavy Flooding";
+
+  }
+
+  Serial.print("Flood Type: ");
+  Serial.println(floodType);
+}
+
+// ==================================================
+// JSON GENERATION
+// ==================================================
+
+String createCurrentJSON() {
+
+  String json = "{";
+
+  json += "\"date\":\"" + currentDate + "\",";
+  json += "\"time\":\"" + currentTime + "\",";
+  json += "\"timestamp\":" + String(currentTimestamp) + ",";
+  json += "\"flood_type\":\"" + floodType + "\",";
+  json += "\"location\":\"" + String(location) + "\",";
+  json += "\"water_level\":" + String(waterHeight, 2);
+
+  json += "}";
+
+  return json;
+}
+
+// --------------------------------------------------
+
+String createHistoryJSON() {
+
+  String json = "{";
+
+  json += "\"sensor_id\":\"" + String(sensorID) + "\",";
+  json += "\"date\":\"" + currentDate + "\",";
+  json += "\"time\":\"" + currentTime + "\",";
+  json += "\"timestamp\":" + String(currentTimestamp) + ",";
+  json += "\"water_level\":" + String(waterHeight, 2);
+
+  json += "}";
+
+  return json;
+}
+
+// ==================================================
+// FIREBASE HTTP POST THROUGH AIR780E
+// ==================================================
+
+bool uploadHTTP(
+  String url,
+  String json,
+  int expectedStatus = 200
+) {
+
+  Serial.println();
+  Serial.println("========== AIR780E HTTP UPLOAD ==========");
+
+  // Close any previous HTTP session.
+  sendAT("AT+HTTPTERM", 3000);
+
+  if (!sendAT("AT+HTTPINIT")) {
+    return false;
+  }
+
+  if (!sendAT("AT+HTTPSSL=1")) {
+    sendAT("AT+HTTPTERM");
+    return false;
+  }
+
+  if (!sendAT("AT+HTTPPARA=\"CID\",1")) {
+    sendAT("AT+HTTPTERM");
+    return false;
+  }
+
+  // Configure URL.
+
+  String urlCommand =
+    "AT+HTTPPARA=\"URL\",\"";
+
+  urlCommand += url;
+  urlCommand += "\"";
+
+  if (!sendAT(urlCommand, 15000)) {
+    sendAT("AT+HTTPTERM");
+    return false;
+  }
+
+  // Configure JSON content.
+
+  if (!sendAT(
+    "AT+HTTPPARA=\"CONTENT\",\"application/json\""
+  )) {
+    sendAT("AT+HTTPTERM");
+    return false;
+  }
+
+  // Tell modem how many bytes to receive.
+
+  String dataCommand =
+    "AT+HTTPDATA=" +
+    String(json.length()) +
+    ",10000";
+
+  Serial.println();
+  Serial.println(">> " + dataCommand);
+
+  airSerial.println(dataCommand);
+
+  String downloadResponse;
+
+  if (!waitForToken(
+    "DOWNLOAD",
+    12000,
+    downloadResponse
+  )) {
+
+    Serial.println("DOWNLOAD prompt missing!");
+
+    sendAT("AT+HTTPTERM");
+
+    return false;
+  }
+
+  // Send JSON body.
+
+  Serial.println("\nSending JSON:");
+
+  Serial.println(json);
+
+  airSerial.print(json);
+
+  String dataResponse;
+
+  if (!waitForToken(
+    "OK",
+    15000,
+    dataResponse
+  )) {
+
+    Serial.println("JSON transmission failed!");
+
+    sendAT("AT+HTTPTERM");
+
+    return false;
+  }
+
+  Serial.println("\nJSON accepted by AIR780E.");
+
+  // Perform POST.
+
+  Serial.println("\nStarting HTTP POST...");
+
+  airSerial.println("AT+HTTPACTION=1");
+
+  String actionOK;
+
+  if (!waitForToken("OK", 10000, actionOK)) {
+
+    Serial.println("HTTPACTION command failed!");
+
+    sendAT("AT+HTTPTERM");
+
+    return false;
+  }
+
+  // Wait for asynchronous HTTP result.
+
+  String actionResponse;
+
+  if (!waitForToken(
+    "+HTTPACTION:",
+    60000,
+    actionResponse
+  )) {
+
+    Serial.println("HTTP ACTION timed out!");
+
+    sendAT("AT+HTTPTERM");
+
+    return false;
+  }
+
+  // Read the rest of the HTTPACTION line.
+
+  unsigned long lineStart = millis();
+
+  while (millis() - lineStart < 3000) {
+
+    while (airSerial.available()) {
+
+      char c = airSerial.read();
+
+      Serial.write(c);
+
+      actionResponse += c;
+
+      if (c == '\n') {
+        break;
+      }
+    }
+
+    if (actionResponse.endsWith("\n")) {
+      break;
+    }
+
+    yield();
+  }
+
+  // Extract HTTP status.
+
+  int firstComma = actionResponse.indexOf(',');
+  int secondComma =
+    actionResponse.indexOf(',', firstComma + 1);
+
+  int httpStatus = 0;
+
+  if (firstComma >= 0 && secondComma > firstComma) {
+
+    httpStatus = actionResponse.substring(
+      firstComma + 1,
+      secondComma
+    ).toInt();
+  }
+
+  Serial.println();
+
+  Serial.print("HTTP STATUS: ");
+  Serial.println(httpStatus);
+
+  // Read Firebase response.
+
+  Serial.println("\nReading Firebase response...");
+
+  String readResponse;
+
+  sendAT("AT+HTTPREAD", 15000, &readResponse);
+
+  sendAT("AT+HTTPTERM", 5000);
+
+  if (httpStatus == expectedStatus) {
+
+    Serial.println("\nFIREBASE UPLOAD SUCCESSFUL!");
+
+    return true;
+  }
+
+  Serial.println("\nFIREBASE UPLOAD FAILED!");
+
+  return false;
+}
+
+// ==================================================
+// FIREBASE UPLOAD
+// ==================================================
+
+void uploadFirebase() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       FIREBASE UPLOAD");
+  Serial.println("================================");
+
+  if (!timeValid) {
+
+    Serial.println("Time unavailable. Trying NTP...");
+
+    if (!syncNetworkTime()) {
+
+      Serial.println("Time sync failed; skipping upload.");
+
+      return;
+    }
+  }
+
+  String currentJSON = createCurrentJSON();
+
+  String historyJSON = createHistoryJSON();
+
+  // ================================================
+  // 1. UPDATE LATEST SENSOR READING
+  // ================================================
+
+  Serial.println();
+  Serial.println("UPDATING CURRENT SENSOR DATA...");
+
+  String currentURL =
+    String(firebaseURL) +
+    "/flood_details/" +
+    String(sensorID) +
+    ".json?x-http-method-override=PUT";
+
+  bool currentSuccess = uploadHTTP(
+    currentURL,
+    currentJSON
+  );
+
+  // ================================================
+  // 2. SAVE HISTORY
+  // ================================================
+
+  Serial.println();
+  Serial.println("SAVING WATER LEVEL HISTORY...");
+
+  String historyURL =
+    String(firebaseURL) +
+    "/water_level_history.json";
+
+  bool historySuccess = uploadHTTP(
+    historyURL,
+    historyJSON
+  );
+
+  // ================================================
+
+  Serial.println();
+  Serial.println("========== UPLOAD SUMMARY ==========");
+
+  Serial.print("Current Data: ");
+  Serial.println(currentSuccess ? "SUCCESS" : "FAILED");
+
+  Serial.print("History Data: ");
+  Serial.println(historySuccess ? "SUCCESS" : "FAILED");
+}
+
+// ==================================================
+// LOCAL WEB DASHBOARD
+// ==================================================
+
+void handleWebServer() {
+
+  WiFiClient client = server.available();
+
+  if (!client) {
+    return;
+  }
+
+  unsigned long timeout = millis();
+
+  while (client.connected() && !client.available()) {
+
+    delay(1);
+
+    if (millis() - timeout > 2000) {
+
+      client.stop();
+
+      return;
+    }
+  }
+
+  client.readStringUntil('\r');
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+
+  client.println("<!DOCTYPE html>");
+  client.println("<html>");
+  client.println("<head>");
+
+  client.println(
+    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+  );
+
+  client.println("<meta http-equiv='refresh' content='2'>");
+  client.println("<title>FloodWatch</title>");
+
+  client.println("</head>");
+
+  client.println(
+    "<body style='text-align:center;font-family:Arial;"
+    "background:#0B0F5B;color:white;'>"
+  );
+
+  client.println("<h1>FloodWatch Sensor</h1>");
+
+  client.print("<h2>Distance: ");
+  client.print(distance, 2);
+  client.println(" cm</h2>");
+
+  client.print("<h2>Water Level: ");
+  client.print(waterHeight, 2);
+  client.println(" cm</h2>");
+
+  client.print("<h2>Flood Type: ");
+  client.print(floodType);
+  client.println("</h2>");
+
+  client.print("<h3>Date: ");
+  client.print(currentDate);
+  client.println("</h3>");
+
+  client.print("<h3>Time: ");
+  client.print(currentTime);
+  client.println("</h3>");
+
+  client.print("<h3>Cellular Time: ");
+  client.print(timeValid ? "Synchronized" : "Not synchronized");
+  client.println("</h3>");
+
+  client.println("</body>");
+  client.println("</html>");
+
+  client.stop();
+}
+
+// ==================================================
+// SETUP
+// ==================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  airSerial.begin(9600);
+
+  delay(2000);
+
+  airSerial.println("AT");
+  delay(1000);
+
+  while (airSerial.available()) {
+  Serial.write(airSerial.read());
+  }
+
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+
+  digitalWrite(TRIG, LOW);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       FLOODWATCH SYSTEM");
+  Serial.println("================================");
+
+  // ================================================
+  // START LOCAL ESP8266 ACCESS POINT
+  // ================================================
+
+  WiFi.mode(WIFI_AP);
+
+  WiFi.softAP(apName, apPassword);
+
+  Serial.println();
+  Serial.println("LOCAL DASHBOARD STARTED");
+
+  Serial.print("WiFi Name: ");
+  Serial.println(apName);
+
+  Serial.print("Dashboard IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.begin();
+
+  // ================================================
+  // CHECK AIR780E
+  // ================================================
+
+  Serial.println();
+  Serial.println("Checking AIR780E...");
+
+  String modemResponse;
+
+  bool modemReady = false;
+
+  for (int i = 0; i < 5; i++) {
+
+    if (sendAT("AT", 3000)) {
+
+      modemReady = true;
+
+      break;
+    }
+
+    delay(1000);
+  }
+
+  if (!modemReady) {
+
+    Serial.println("AIR780E NOT RESPONDING!");
+
+    Serial.println("Check UART wiring and power.");
+
+    return;
+  }
+
+  Serial.println();
+  Serial.println("AIR780E READY!");
+
+  // ================================================
+  // SYNCHRONIZE MODEM TIME
+  // ================================================
+
+  syncNetworkTime();
+
+  previousTimeSync = millis();
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       SYSTEM READY");
+  Serial.println("================================");
+}
+
+// ==================================================
+// LOOP
+// ==================================================
+
+void loop() {
+
+  // ================================================
+  // SENSOR READING
+  // ================================================
+
+  if (millis() - previousSensorRead >= sensorInterval) {
+
+    previousSensorRead = millis();
+
+    sensorValid = readSensor();
+
+    if (sensorValid) {
+      classifyFlood();
+    }
+  }
+
+  // ================================================
+  // NETWORK TIME RESYNC
+  // ================================================
+
+  if (millis() - previousTimeSync >= timeSyncInterval) {
+
+    previousTimeSync = millis();
+
+    syncNetworkTime();
+  }
+
+  // ================================================
+  // FIREBASE UPLOAD
+  // ================================================
+
+  if (millis() - previousUpload >= uploadInterval) {
+
+    previousUpload = millis();
+
+    if (sensorValid) {
+
+      uploadFirebase();
+
+    }
+    else {
+
+      Serial.println(
+        "Upload skipped: No valid sensor reading."
+      );
+    }
+  }
+
+  // ================================================
+  // LOCAL DASHBOARD
+  // ================================================
+
+  handleWebServer();
+
+  yield();
+}
