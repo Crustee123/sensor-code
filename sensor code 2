@@ -4,12 +4,22 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 
+// =====================================================
+// FLOODWATCH ESP8266 - COMPLETE SENSOR SYSTEM
+// =====================================================
+
 // ================= SENSOR =================
+
 #define TRIG D1
 #define ECHO D2
 
-// CHANGE THIS TO YOUR ACTUAL SENSOR-TO-BOTTOM DISTANCE
-const float SENSOR_HEIGHT = 100.0;
+// ================= BATTERY =================
+
+#define BATTERY_PIN A0
+
+// Adjust according to your actual voltage divider
+const float ADC_FULL_SCALE = 3.3;
+const float DIVIDER_RATIO = 5.0;
 
 // ================= WIFI =================
 
@@ -23,18 +33,58 @@ const char* firebaseURL =
 
 const char* sensorID = "sensor2";
 
-// ================= SETTINGS =================
+const char* location =
+  "Bambang purok 4, Bocaue Bulacan";
+
+// ================= FIREBASE SETTINGS =================
+
+String settingsURL =
+  String(firebaseURL) +
+  "/sensor_settings/" +
+  String(sensorID) +
+  ".json";
+
+String currentURL =
+  String(firebaseURL) +
+  "/flood_details/" +
+  String(sensorID) +
+  ".json";
+
+String historyURL =
+  String(firebaseURL) +
+  "/water_level_history.json";
+
+String batteryURL =
+  String(firebaseURL) +
+  "/battery_status/" +
+  String(sensorID) +
+  ".json";
+
+// ================= DEFAULT SETTINGS =================
+
+// These values are used if Firebase settings
+// cannot be retrieved.
+
+float SENSOR_HEIGHT = 50.0;
+
+float LIGHT_FLOODING_LEVEL = 10.0;
+float FLOODING_LEVEL = 20.0;
+float HEAVY_FLOODING_LEVEL = 35.0;
+
+// ================= INTERVALS =================
 
 const unsigned long uploadInterval = 2000;
 const unsigned long sensorInterval = 100;
 
-const char* location = "Bambang purok 4, Bocaue Bulacan";
+const unsigned long settingsFetchInterval = 10000;
+
+const unsigned long batteryUploadInterval = 5000;
 
 // ================= SERVER =================
 
 WiFiServer server(80);
 
-// ================= VARIABLES =================
+// ================= SENSOR VARIABLES =================
 
 float distance = 0;
 float waterHeight = 0;
@@ -43,32 +93,44 @@ String floodType = "No Flood";
 
 unsigned long previousUpload = 0;
 unsigned long previousSensorRead = 0;
+unsigned long previousSettingsFetch = 0;
+unsigned long previousBatteryUpload = 0;
 
 bool sensorValid = false;
 
-// ================= SETUP =================
+// ================= BATTERY VARIABLES =================
 
-void setup() {
+float batteryVoltage = 0;
+float previousBatteryVoltage = 0;
 
-  Serial.begin(115200);
+float voltageTrend = 0;
 
-  pinMode(TRIG, OUTPUT);
-  pinMode(ECHO, INPUT);
+int batteryPercentage = 0;
 
-  digitalWrite(TRIG, LOW);
+String chargingStatus = "Checking";
 
-  Serial.println();
-  Serial.println("================================");
-  Serial.println("       FLOODWATCH ESP8266       ");
-  Serial.println("================================");
+unsigned long previousTrendCheck = 0;
+
+const unsigned long trendCheckInterval = 30000;
+
+// =====================================================
+// WIFI CONNECTION
+// =====================================================
+
+void connectWiFi() {
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
 
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting to WiFi");
 
   while (WiFi.status() != WL_CONNECTED) {
+
     delay(500);
     Serial.print(".");
+
   }
 
   Serial.println();
@@ -77,64 +139,435 @@ void setup() {
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 
-  configTime(28800, 0, "pool.ntp.org", "time.google.com");
-
-  Serial.print("Syncing time");
-
-  time_t now = time(nullptr);
-
-  while (now < 100000) {
-    delay(500);
-    Serial.print(".");
-    now = time(nullptr);
-  }
-
-  Serial.println();
-  Serial.println("Time synchronized!");
-
-  server.begin();
-
-  Serial.println("Web Server Started!");
-  Serial.println("Firebase Ready!");
-  Serial.println("================================");
 }
 
-// ================= SENSOR =================
+// =====================================================
+// BATTERY VOLTAGE READING
+// =====================================================
+
+float readBatteryVoltage() {
+
+  long total = 0;
+
+  for (int i = 0; i < 20; i++) {
+
+    total += analogRead(BATTERY_PIN);
+
+    delay(5);
+
+  }
+
+  float raw = total / 20.0;
+
+  float adcVoltage =
+    raw * (ADC_FULL_SCALE / 1023.0);
+
+  float voltage =
+    adcVoltage * DIVIDER_RATIO;
+
+  return voltage;
+
+}
+
+// =====================================================
+// BATTERY PERCENTAGE
+// =====================================================
+
+int calculateBatteryPercentage(float voltage) {
+
+  if (voltage >= 4.20) return 100;
+  if (voltage >= 4.10) return 90;
+  if (voltage >= 4.00) return 80;
+  if (voltage >= 3.90) return 60;
+  if (voltage >= 3.80) return 40;
+  if (voltage >= 3.70) return 20;
+  if (voltage >= 3.50) return 5;
+
+  return 0;
+
+}
+
+// =====================================================
+// ESTIMATED CHARGING DETECTION
+// =====================================================
+
+void updateChargingStatus(float voltage) {
+
+  if (previousBatteryVoltage == 0) {
+
+    previousBatteryVoltage = voltage;
+
+    chargingStatus = "Checking";
+
+    previousTrendCheck = millis();
+
+    return;
+
+  }
+
+  if (millis() - previousTrendCheck >= trendCheckInterval) {
+
+    voltageTrend =
+      voltage - previousBatteryVoltage;
+
+    if (voltageTrend > 0.02) {
+
+      chargingStatus = "Probably Charging";
+
+    }
+    else if (voltageTrend < -0.02) {
+
+      chargingStatus = "Discharging";
+
+    }
+    else {
+
+      chargingStatus = "Stable";
+
+    }
+
+    previousBatteryVoltage = voltage;
+
+    previousTrendCheck = millis();
+
+  }
+
+}
+
+// =====================================================
+// BATTERY MONITORING
+// =====================================================
+
+void uploadBatteryData() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println("Battery Upload: WiFi Disconnected!");
+
+    return;
+
+  }
+
+  batteryVoltage = readBatteryVoltage();
+
+  batteryPercentage =
+    calculateBatteryPercentage(batteryVoltage);
+
+  updateChargingStatus(batteryVoltage);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  if (!http.begin(client, batteryURL)) {
+
+    Serial.println("Battery HTTP Begin Failed!");
+
+    return;
+
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  http.setTimeout(10000);
+
+  String json = "{";
+
+  json += "\"voltage\":" +
+          String(batteryVoltage, 2) + ",";
+
+  json += "\"percentage\":" +
+          String(batteryPercentage) + ",";
+
+  json += "\"charging_status\":\"" +
+          chargingStatus + "\",";
+
+  json += "\"charging_trend\":" +
+          String(voltageTrend, 3) + ",";
+
+  json += "\"last_updated\":" +
+          String((unsigned long)time(nullptr));
+
+  json += "}";
+
+  Serial.println();
+  Serial.println("========== BATTERY ==========");
+
+  Serial.print("Voltage: ");
+  Serial.print(batteryVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Percentage: ");
+  Serial.print(batteryPercentage);
+  Serial.println("%");
+
+  Serial.print("Charging Status: ");
+  Serial.println(chargingStatus);
+
+  Serial.print("Voltage Trend: ");
+  Serial.println(voltageTrend, 3);
+
+  int response = http.PUT(json);
+
+  Serial.print("Battery Firebase Response: ");
+  Serial.println(response);
+
+  if (response > 0) {
+
+    Serial.println(http.getString());
+
+  }
+  else {
+
+    Serial.println(http.errorToString(response));
+
+  }
+
+  http.end();
+
+}
+
+// =====================================================
+// SETTINGS JSON READER
+// =====================================================
+
+float getSetting(
+  String json,
+  String key,
+  float fallback
+) {
+
+  String searchKey = "\"" + key + "\"";
+
+  int keyPosition = json.indexOf(searchKey);
+
+  if (keyPosition < 0) {
+
+    return fallback;
+
+  }
+
+  int colonPosition =
+    json.indexOf(":", keyPosition);
+
+  if (colonPosition < 0) {
+
+    return fallback;
+
+  }
+
+  int start = colonPosition + 1;
+
+  while (
+    start < json.length() &&
+    (json[start] == ' ' ||
+     json[start] == '\n' ||
+     json[start] == '\r')
+  ) {
+
+    start++;
+
+  }
+
+  int end = start;
+
+  while (
+    end < json.length() &&
+    json[end] != ',' &&
+    json[end] != '}'
+  ) {
+
+    end++;
+
+  }
+
+  String value =
+    json.substring(start, end);
+
+  value.trim();
+
+  if (value.length() == 0) {
+
+    return fallback;
+
+  }
+
+  return value.toFloat();
+
+}
+
+// =====================================================
+// FETCH FLUTTERFLOW SETTINGS
+// =====================================================
+
+void fetchSensorSettings() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println("Settings Fetch: WiFi Disconnected!");
+
+    return;
+
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  Serial.println();
+  Serial.println("Fetching Firebase Sensor Settings...");
+
+  if (!http.begin(client, settingsURL)) {
+
+    Serial.println("Settings HTTP Begin Failed!");
+
+    return;
+
+  }
+
+  http.setTimeout(10000);
+
+  int response = http.GET();
+
+  if (response == 200) {
+
+    String json = http.getString();
+
+    Serial.println("Received Settings:");
+    Serial.println(json);
+
+    float newHeight =
+      getSetting(
+        json,
+        "tube_height_cm",
+        SENSOR_HEIGHT
+      );
+
+    float newLight =
+      getSetting(
+        json,
+        "light_flooding_cm",
+        LIGHT_FLOODING_LEVEL
+      );
+
+    float newFlood =
+      getSetting(
+        json,
+        "flooding_cm",
+        FLOODING_LEVEL
+      );
+
+    float newHeavy =
+      getSetting(
+        json,
+        "heavy_flooding_cm",
+        HEAVY_FLOODING_LEVEL
+      );
+
+    // Validate all settings
+
+    if (
+      newHeight > newHeavy &&
+      newHeavy > newFlood &&
+      newFlood > newLight &&
+      newLight > 0
+    ) {
+
+      SENSOR_HEIGHT = newHeight;
+
+      LIGHT_FLOODING_LEVEL = newLight;
+
+      FLOODING_LEVEL = newFlood;
+
+      HEAVY_FLOODING_LEVEL = newHeavy;
+
+      Serial.println("SETTINGS UPDATED!");
+
+    }
+    else {
+
+      Serial.println(
+        "INVALID SETTINGS! Keeping previous configuration."
+      );
+
+    }
+
+    Serial.println("========== CONFIGURATION ==========");
+
+    Serial.print("Tube Height: ");
+    Serial.println(SENSOR_HEIGHT);
+
+    Serial.print("Light Flooding: ");
+    Serial.println(LIGHT_FLOODING_LEVEL);
+
+    Serial.print("Flooding: ");
+    Serial.println(FLOODING_LEVEL);
+
+    Serial.print("Heavy Flooding: ");
+    Serial.println(HEAVY_FLOODING_LEVEL);
+
+  }
+  else {
+
+    Serial.print("Settings Fetch Failed: ");
+    Serial.println(response);
+
+  }
+
+  http.end();
+
+}
+
+// =====================================================
+// SENSOR READING
+// =====================================================
 
 bool readSensor() {
 
   digitalWrite(TRIG, LOW);
+
   delayMicroseconds(5);
 
   digitalWrite(TRIG, HIGH);
+
   delayMicroseconds(10);
 
   digitalWrite(TRIG, LOW);
 
-  // 35ms timeout = approximately 6 meters
-  unsigned long duration = pulseIn(ECHO, HIGH, 35000);
+  unsigned long duration =
+    pulseIn(ECHO, HIGH, 35000);
 
   if (duration == 0) {
 
-    Serial.println("Sensor Timeout! Keeping previous reading.");
+    Serial.println("Sensor Timeout!");
 
     return false;
+
   }
 
-  float newDistance = duration * 0.0343 / 2.0;
+  float newDistance =
+    duration * 0.0343 / 2.0;
 
-  // Reject impossible readings
-  if (newDistance <= 2 || newDistance > SENSOR_HEIGHT) {
+  if (
+    newDistance <= 2 ||
+    newDistance > SENSOR_HEIGHT
+  ) {
 
     Serial.println("Invalid Sensor Reading!");
 
     return false;
+
   }
 
   distance = newDistance;
 
-  // Calculate actual water height
-  waterHeight = SENSOR_HEIGHT - distance;
+  waterHeight =
+    SENSOR_HEIGHT - distance;
+
+  Serial.println();
+  Serial.println("========== SENSOR ==========");
 
   Serial.print("Distance: ");
   Serial.print(distance, 2);
@@ -145,25 +578,28 @@ bool readSensor() {
   Serial.println(" cm");
 
   return true;
+
 }
 
-// ================= FLOOD CLASSIFICATION =================
+// =====================================================
+// FLOOD CLASSIFICATION
+// =====================================================
 
 void classifyFlood() {
 
-  if (waterHeight >= 70) {
+  if (waterHeight < LIGHT_FLOODING_LEVEL) {
 
     floodType = "No Flood";
 
   }
-  else if (waterHeight >= 60) {
-
-    floodType = "Flooding";
-
-  }
-  else if (waterHeight >= 40) {
+  else if (waterHeight < FLOODING_LEVEL) {
 
     floodType = "Light Flooding";
+
+  }
+  else if (waterHeight < HEAVY_FLOODING_LEVEL) {
+
+    floodType = "Flooding";
 
   }
   else {
@@ -174,91 +610,123 @@ void classifyFlood() {
 
   Serial.print("Flood Type: ");
   Serial.println(floodType);
+
 }
 
-// ================= DATE =================
+// =====================================================
+// DATE
+// =====================================================
 
 String getDate() {
 
   time_t now = time(nullptr);
 
   struct tm timeinfo;
+
   localtime_r(&now, &timeinfo);
 
   char buffer[30];
 
-  strftime(buffer, sizeof(buffer), "%B %d, %Y", &timeinfo);
+  strftime(
+    buffer,
+    sizeof(buffer),
+    "%B %d, %Y",
+    &timeinfo
+  );
 
   return String(buffer);
+
 }
 
-// ================= TIME =================
+// =====================================================
+// TIME
+// =====================================================
 
 String getTime() {
 
   time_t now = time(nullptr);
 
   struct tm timeinfo;
+
   localtime_r(&now, &timeinfo);
 
   char buffer[20];
 
-  strftime(buffer, sizeof(buffer), "%I:%M:%S %p", &timeinfo);
+  strftime(
+    buffer,
+    sizeof(buffer),
+    "%I:%M:%S %p",
+    &timeinfo
+  );
 
   return String(buffer);
+
 }
 
-// ================= TIMESTAMP =================
+// =====================================================
+// TIMESTAMP
+// =====================================================
 
 unsigned long getTimestamp() {
 
   return (unsigned long)time(nullptr);
+
 }
 
-// ================= FIREBASE =================
-
+// =====================================================
+// FIREBASE WATER LEVEL UPLOAD
+// =====================================================
 
 void uploadFirebase() {
 
   if (WiFi.status() != WL_CONNECTED) {
+
     Serial.println("WiFi Disconnected!");
+
     return;
+
   }
 
-  // ================= HTTPS CLIENT =================
-
   WiFiClientSecure client;
+
   client.setInsecure();
 
   // ================= CURRENT DATA =================
 
   HTTPClient http;
 
-  String currentURL =
-    String(firebaseURL) +
-    "/flood_details/" +
-    String(sensorID) +
-    ".json";
-
   Serial.println();
-  Serial.println("Uploading Current Data...");
+  Serial.println("Uploading Current Water Level...");
 
   if (!http.begin(client, currentURL)) {
+
     Serial.println("Current HTTP Begin Failed!");
+
     return;
+
   }
 
   http.addHeader("Content-Type", "application/json");
+
   http.setTimeout(15000);
 
   String json = "{";
 
   json += "\"date\":\"" + getDate() + "\",";
+
   json += "\"time\":\"" + getTime() + "\",";
-  json += "\"timestamp\":" + String(getTimestamp()) + ",";
-  json += "\"flood_type\":\"" + floodType + "\",";
-  json += "\"location\":\"" + String(location) + "\",";
-  json += "\"water_level\":" + String(waterHeight, 2);
+
+  json += "\"timestamp\":" +
+          String(getTimestamp()) + ",";
+
+  json += "\"flood_type\":\"" +
+          floodType + "\",";
+
+  json += "\"location\":\"" +
+          String(location) + "\",";
+
+  json += "\"water_level\":" +
+          String(waterHeight, 2);
 
   json += "}";
 
@@ -270,11 +738,25 @@ void uploadFirebase() {
   Serial.println(response);
 
   if (response == 200) {
+
     Serial.println("Current Data Updated!");
+
   }
   else {
+
     Serial.println("Current Data Upload Failed!");
-    Serial.println(http.errorToString(response));
+
+    if (response < 0) {
+
+      Serial.println(http.errorToString(response));
+
+    }
+    else {
+
+      Serial.println(http.getString());
+
+    }
+
   }
 
   http.end();
@@ -285,35 +767,45 @@ void uploadFirebase() {
 
   HTTPClient historyHTTP;
 
-  String historyURL =
-    String(firebaseURL) +
-    "/water_level_history.json";
-
   Serial.println();
   Serial.println("Uploading Water Level History...");
 
   if (!historyHTTP.begin(client, historyURL)) {
+
     Serial.println("History HTTP Begin Failed!");
+
     return;
+
   }
 
-  historyHTTP.addHeader("Content-Type", "application/json");
+  historyHTTP.addHeader(
+    "Content-Type",
+    "application/json"
+  );
+
   historyHTTP.setTimeout(15000);
 
   String historyJSON = "{";
 
-  historyJSON += "\"sensor_id\":\"" + String(sensorID) + "\",";
-  historyJSON += "\"date\":\"" + getDate() + "\",";
-  historyJSON += "\"time\":\"" + getTime() + "\",";
-  historyJSON += "\"timestamp\":" + String(getTimestamp()) + ",";
-  historyJSON += "\"water_level\":" + String(waterHeight, 2);
+  historyJSON += "\"sensor_id\":\"" +
+                 String(sensorID) + "\",";
+
+  historyJSON += "\"date\":\"" +
+                 getDate() + "\",";
+
+  historyJSON += "\"time\":\"" +
+                 getTime() + "\",";
+
+  historyJSON += "\"timestamp\":" +
+                 String(getTimestamp()) + ",";
+
+  historyJSON += "\"water_level\":" +
+                 String(waterHeight, 2);
 
   historyJSON += "}";
 
-  Serial.println("History JSON:");
-  Serial.println(historyJSON);
-
-  int historyResponse = historyHTTP.POST(historyJSON);
+  int historyResponse =
+    historyHTTP.POST(historyJSON);
 
   Serial.print("History Response: ");
   Serial.println(historyResponse);
@@ -322,7 +814,6 @@ void uploadFirebase() {
 
     Serial.println("History Saved Successfully!");
 
-    Serial.print("Firebase Response: ");
     Serial.println(historyHTTP.getString());
 
   }
@@ -331,12 +822,16 @@ void uploadFirebase() {
     Serial.println("History Upload Failed!");
 
     if (historyResponse > 0) {
+
       Serial.println(historyHTTP.getString());
+
     }
     else {
+
       Serial.println(
         historyHTTP.errorToString(historyResponse)
       );
+
     }
 
   }
@@ -344,51 +839,74 @@ void uploadFirebase() {
   historyHTTP.end();
 
   yield();
+
 }
 
-// ================= WEB DASHBOARD =================
+// =====================================================
+// WEB DASHBOARD
+// =====================================================
 
 void handleWebServer() {
 
   WiFiClient client = server.available();
 
   if (!client) {
+
     return;
+
   }
 
   unsigned long timeout = millis();
 
-  while (client.connected() && !client.available()) {
+  while (
+    client.connected() &&
+    !client.available()
+  ) {
 
     delay(1);
 
     if (millis() - timeout > 2000) {
+
       client.stop();
+
       return;
+
     }
+
   }
 
   client.readStringUntil('\r');
 
   client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/html");
+
+  client.println(
+    "Content-Type: text/html; charset=utf-8"
+  );
+
   client.println("Connection: close");
+
   client.println();
 
   client.println("<!DOCTYPE html>");
+
   client.println("<html>");
+
   client.println("<head>");
 
   client.println(
     "<meta name='viewport' content='width=device-width, initial-scale=1'>"
   );
 
-  client.println("<meta http-equiv='refresh' content='2'>");
+  client.println(
+    "<meta http-equiv='refresh' content='2'>"
+  );
+
   client.println("<title>FloodWatch</title>");
+
   client.println("</head>");
 
   client.println(
-    "<body style='text-align:center;font-family:Arial;background:#0B0F5B;color:white;'>"
+    "<body style='text-align:center;font-family:Arial;background:#0B0F5B;color:white;padding:20px;'>"
   );
 
   client.println("<h1>FloodWatch Sensor</h1>");
@@ -405,42 +923,229 @@ void handleWebServer() {
   client.print(floodType);
   client.println("</h2>");
 
+  client.println("<hr>");
+
+  client.println("<h2>Battery Monitoring</h2>");
+
+  client.print("<h3>Voltage: ");
+  client.print(batteryVoltage, 2);
+  client.println(" V</h3>");
+
+  client.print("<h3>Battery: ");
+  client.print(batteryPercentage);
+  client.println("%</h3>");
+
+  client.print("<h3>Charging: ");
+  client.print(chargingStatus);
+  client.println("</h3>");
+
+  client.println("<hr>");
+
+  client.println("<h2>Sensor Configuration</h2>");
+
+  client.print("<p>Tube Height: ");
+  client.print(SENSOR_HEIGHT);
+  client.println(" cm</p>");
+
+  client.print("<p>Light Flooding: ");
+  client.print(LIGHT_FLOODING_LEVEL);
+  client.println(" cm</p>");
+
+  client.print("<p>Flooding: ");
+  client.print(FLOODING_LEVEL);
+  client.println(" cm</p>");
+
+  client.print("<p>Heavy Flooding: ");
+  client.print(HEAVY_FLOODING_LEVEL);
+  client.println(" cm</p>");
+
   client.println("</body>");
+
   client.println("</html>");
 
   client.stop();
+
 }
 
-// ================= LOOP =================
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  pinMode(TRIG, OUTPUT);
+
+  pinMode(ECHO, INPUT);
+
+  pinMode(BATTERY_PIN, INPUT);
+
+  digitalWrite(TRIG, LOW);
+
+  Serial.println();
+
+  Serial.println("================================");
+
+  Serial.println("       FLOODWATCH ESP8266       ");
+
+  Serial.println("================================");
+
+  connectWiFi();
+
+  // ================= TIME =================
+
+  configTime(
+    28800,
+    0,
+    "pool.ntp.org",
+    "time.google.com"
+  );
+
+  Serial.print("Syncing time");
+
+  time_t now = time(nullptr);
+
+  while (now < 100000) {
+
+    delay(500);
+
+    Serial.print(".");
+
+    now = time(nullptr);
+
+  }
+
+  Serial.println();
+
+  Serial.println("Time synchronized!");
+
+  // ================= FETCH SETTINGS =================
+
+  fetchSensorSettings();
+
+  previousSettingsFetch = millis();
+
+  // ================= INITIAL BATTERY =================
+
+  batteryVoltage = readBatteryVoltage();
+
+  batteryPercentage =
+    calculateBatteryPercentage(batteryVoltage);
+
+  previousBatteryVoltage = batteryVoltage;
+
+  previousTrendCheck = millis();
+
+  // ================= SERVER =================
+
+  server.begin();
+
+  Serial.println("Web Server Started!");
+
+  Serial.println("Firebase Ready!");
+
+  Serial.println("Battery Monitoring Ready!");
+
+  Serial.println("================================");
+
+}
+
+// =====================================================
+// LOOP
+// =====================================================
 
 void loop() {
 
-  // Read sensor at controlled intervals
-  if (millis() - previousSensorRead >= sensorInterval) {
+  // ================= WIFI RECONNECTION =================
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println("WiFi Disconnected! Reconnecting...");
+
+    WiFi.reconnect();
+
+    delay(100);
+
+    handleWebServer();
+
+    return;
+
+  }
+
+  // ================= SENSOR READING =================
+
+  if (
+    millis() - previousSensorRead >= sensorInterval
+  ) {
 
     previousSensorRead = millis();
 
     sensorValid = readSensor();
 
     if (sensorValid) {
+
       classifyFlood();
+
     }
+
   }
 
-  // Upload every 5 seconds
-  if (millis() - previousUpload >= uploadInterval) {
+  // ================= SETTINGS FETCH =================
+
+  if (
+    millis() - previousSettingsFetch >=
+    settingsFetchInterval
+  ) {
+
+    previousSettingsFetch = millis();
+
+    fetchSensorSettings();
+
+  }
+
+  // ================= WATER LEVEL UPLOAD =================
+
+  if (
+    millis() - previousUpload >= uploadInterval
+  ) {
 
     previousUpload = millis();
 
     if (sensorValid) {
+
       uploadFirebase();
+
     }
     else {
-      Serial.println("Upload Skipped: No Valid Sensor Reading.");
+
+      Serial.println(
+        "Water Upload Skipped: Invalid Sensor Reading."
+      );
+
     }
+
   }
+
+  // ================= BATTERY UPLOAD =================
+
+  if (
+    millis() - previousBatteryUpload >=
+    batteryUploadInterval
+  ) {
+
+    previousBatteryUpload = millis();
+
+    uploadBatteryData();
+
+  }
+
+  // ================= WEB DASHBOARD =================
 
   handleWebServer();
 
   yield();
+
 }
