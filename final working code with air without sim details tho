@@ -1,0 +1,850 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <SoftwareSerial.h>
+#include <time.h>
+
+// ============================================================
+// FLOODWATCH - ABSOLUTE FINAL SENSOR CODE
+// ESP8266 + AJ-SR04M + BATTERY MONITOR + AIR780E + FIREBASE
+//
+// PRIMARY INTERNET: AIR780E cellular
+// BACKUP INTERNET: Desierto 2.4G / Galaxy A34 hotspot
+// FIREBASE: current sensor data, history, settings, battery
+// LOCAL DASHBOARD: FloodWatch-Diagnostics access point
+//
+// AIR780E UART:
+// AIR780E TX -> ESP8266 D5
+// ESP8266 D6 -> AIR780E RX
+// AIR780E and ESP8266 MUST share GND.
+// ============================================================
+
+// ================= SENSOR =================
+#define TRIG D1
+#define ECHO D2
+
+// ================= BATTERY =================
+#define BATTERY_PIN A0
+const float ADC_FULL_SCALE = 3.3;
+const float DIVIDER_RATIO = 5.0; // Adjust to your actual voltage divider.
+
+// ================= AIR780E =================
+SoftwareSerial airSerial(D5, D6); // ESP RX, ESP TX
+const uint32_t MODEM_BAUD = 9600;
+
+// ================= WIFI BACKUPS =================
+const char* WIFI_SSID_1 = "Desierto 2.4G";
+const char* WIFI_PASSWORD_1 = "11122931";
+const char* WIFI_SSID_2 = "Galaxy A34 5G F2F3";
+const char* WIFI_PASSWORD_2 = "11111111";
+ESP8266WiFiMulti wifiMulti;
+
+// ================= LOCAL DASHBOARD AP =================
+const char* AP_NAME = "FloodWatch-Diagnostics";
+const char* AP_PASSWORD = "floodwatch123";
+WiFiServer server(80);
+
+// ================= FIREBASE =================
+const char* FIREBASE_ROOT =
+  "https://floodwatch-192e1-default-rtdb.asia-southeast1.firebasedatabase.app";
+const char* sensorID = "sensor2";
+const char* location = "Bambang purok 4, Bocaue Bulacan";
+
+String settingsURL = String(FIREBASE_ROOT) + "/sensor_settings/" + String(sensorID) + ".json";
+String currentURL  = String(FIREBASE_ROOT) + "/flood_details/" + String(sensorID) + ".json";
+String historyURL  = String(FIREBASE_ROOT) + "/water_level_history.json";
+String batteryURL  = String(FIREBASE_ROOT) + "/battery_status/" + String(sensorID) + ".json";
+
+// ================= DEFAULT SENSOR SETTINGS =================
+float SENSOR_HEIGHT = 50.0;
+float LIGHT_FLOODING_LEVEL = 10.0;
+float FLOODING_LEVEL = 20.0;
+float HEAVY_FLOODING_LEVEL = 35.0;
+
+// ================= INTERVALS =================
+const unsigned long uploadInterval = 2000UL;
+const unsigned long sensorInterval = 100UL;
+const unsigned long settingsFetchInterval = 10000UL;
+const unsigned long batteryUploadInterval = 5000UL;
+const unsigned long wifiRetryInterval = 15000UL;
+const unsigned long modemCheckInterval = 30000UL;
+const unsigned long trendCheckInterval = 30000UL;
+
+unsigned long previousUpload = 0;
+unsigned long previousSensorRead = 0;
+unsigned long previousSettingsFetch = 0;
+unsigned long previousBatteryUpload = 0;
+unsigned long previousWifiRetry = 0;
+unsigned long previousModemCheck = 0;
+unsigned long previousTrendCheck = 0;
+
+// ================= SENSOR STATE =================
+float distance = 0;
+float waterHeight = 0;
+String floodType = "No Flood";
+bool sensorValid = false;
+
+// ================= BATTERY STATE =================
+float batteryVoltage = 0;
+float previousBatteryVoltage = 0;
+float voltageTrend = 0;
+int batteryPercentage = 0;
+String chargingStatus = "Checking";
+
+// ================= MODEM / NETWORK STATE =================
+String carrier = "Unknown";
+String imsi = "Unavailable";
+String signalQuality = "Unknown";
+String registrationStatus = "Unknown";
+String modemIP = "Unavailable";
+int signalPercent = -1;
+bool simDetected = false;
+bool networkRegistered = false;
+bool packetAttached = false;
+bool cellularConnected = false;
+bool bearerActive = false;
+bool firebaseConnected = false;
+bool sawPdpDeact = false;
+String activeConnection = "None";
+String lastUpload = "Never";
+String lastError = "None";
+String lastModemURC = "None";
+int lastHTTPStatus = 0;
+unsigned long uploadCounter = 0;
+
+// ============================================================
+// GENERAL HELPERS
+// ============================================================
+String jsonEscape(String s) {
+  s.replace("\\", "\\\\");
+  s.replace("\"", "\\\"");
+  s.replace("\n", "\\n");
+  s.replace("\r", "\\r");
+  s.replace("\t", "\\t");
+  return s;
+}
+
+String boolJSON(bool v) { return v ? "true" : "false"; }
+
+bool isValidIP(const String& ip) {
+  return ip.length() > 6 && ip != "0.0.0.0" && ip != "Unavailable";
+}
+
+void captureURC(const String& s) {
+  if (s.indexOf("+SAPBR: 1: DEACT") >= 0 || s.indexOf("+SAPBR: 1,0") >= 0) {
+    sawPdpDeact = true;
+    bearerActive = false;
+    lastModemURC = "PDP bearer deactivated";
+  }
+  if (s.indexOf("+CEREG:") >= 0) lastModemURC = "CEREG status update";
+}
+
+String lineAfter(const String& s, const String& prefix) {
+  int p = s.indexOf(prefix);
+  if (p < 0) return "";
+  p += prefix.length();
+  int e = s.indexOf('\n', p);
+  if (e < 0) e = s.length();
+  String v = s.substring(p, e);
+  v.trim();
+  return v;
+}
+
+// ============================================================
+// AIR780E AT COMMAND HELPERS
+// ============================================================
+bool sendAT(const String& cmd, uint32_t timeoutMs = 5000, String* result = nullptr) {
+  while (airSerial.available()) airSerial.read();
+  Serial.println();
+  Serial.println(">> " + cmd);
+  airSerial.println(cmd);
+
+  String response;
+  uint32_t start = millis();
+  bool done = false;
+  bool ok = false;
+
+  while (millis() - start < timeoutMs) {
+    while (airSerial.available()) {
+      char c = (char)airSerial.read();
+      Serial.write(c);
+      response += c;
+      if (response.endsWith("\r\nOK\r\n") || response.endsWith("\nOK\n") || response.endsWith("\rOK\r")) {
+        done = true; ok = true; break;
+      }
+      if (response.indexOf("\r\nERROR\r\n") >= 0 || response.indexOf("+CME ERROR:") >= 0) {
+        done = true; ok = false; break;
+      }
+      if (response.length() > 6000) response.remove(0, 3000);
+    }
+    if (done) break;
+    yield();
+  }
+  captureURC(response);
+  if (result) *result = response;
+  if (!done) Serial.println("[MODEM TIMEOUT] " + cmd);
+  return done && ok;
+}
+
+bool waitForText(const String& token, uint32_t timeoutMs, String& response) {
+  response = "";
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    while (airSerial.available()) {
+      char c = (char)airSerial.read();
+      Serial.write(c);
+      response += c;
+      if (response.indexOf(token) >= 0) { captureURC(response); return true; }
+      if (response.length() > 7000) response.remove(0, 3500);
+    }
+    yield();
+  }
+  captureURC(response);
+  return false;
+}
+
+bool waitHTTPAction(int& status, int& dataLen, String& full) {
+  full = ""; status = 0; dataLen = 0;
+  int tokenPos = -1;
+  int lineEnd = -1;
+  uint32_t start = millis();
+  while (millis() - start < 75000UL) {
+    while (airSerial.available()) {
+      char c = (char)airSerial.read();
+      Serial.write(c);
+      full += c;
+      if (tokenPos < 0) {
+        int found = full.indexOf("+HTTPACTION:");
+        if (found >= 0) tokenPos = found;
+      } else if (c == '\n') {
+        lineEnd = (int)full.length() - 1;
+        break;
+      }
+      if (full.length() > 7000) {
+        if (tokenPos >= 0) { full.remove(0, tokenPos); tokenPos = 0; }
+        else full.remove(0, 3500);
+      }
+    }
+    if (lineEnd >= 0) break;
+    yield();
+  }
+  captureURC(full);
+  if (tokenPos < 0 || lineEnd < 0) return false;
+  String line = full.substring(tokenPos, lineEnd);
+  line.trim();
+  int colon = line.indexOf(':');
+  int c1 = line.indexOf(',', colon + 1);
+  int c2 = line.indexOf(',', c1 + 1);
+  if (colon < 0 || c1 < 0 || c2 < 0) return false;
+  String st = line.substring(c1 + 1, c2);
+  String len = line.substring(c2 + 1);
+  st.trim(); len.trim();
+  status = st.toInt(); dataLen = len.toInt();
+  Serial.println("Parsed HTTP status=" + String(status) + ", response bytes=" + String(dataLen));
+  return true;
+}
+
+// ============================================================
+// MODEM DIAGNOSTICS
+// ============================================================
+void checkSIM() {
+  String r;
+  simDetected = false; imsi = "Unavailable"; carrier = "Unknown";
+  if (sendAT("AT+CPIN?", 5000, &r) && r.indexOf("READY") >= 0) simDetected = true;
+  if (!simDetected) { carrier = "No SIM / not ready"; return; }
+  if (sendAT("AT+CIMI", 6000, &r)) {
+    for (int i = 0; i < (int)r.length(); i++) {
+      if (!isDigit(r[i])) continue;
+      int j = i;
+      while (j < (int)r.length() && isDigit(r[j])) j++;
+      if (j - i >= 14 && j - i <= 16) { imsi = r.substring(i, j); break; }
+      i = j;
+    }
+  }
+  if (imsi.startsWith("51502")) carrier = "Globe (IMSI prefix)";
+  else if (imsi.startsWith("51503")) carrier = "Smart (IMSI prefix)";
+}
+
+void checkSignal() {
+  String r; signalQuality = "Unknown"; signalPercent = -1;
+  if (!sendAT("AT+CSQ", 5000, &r)) return;
+  int p = r.indexOf("+CSQ:");
+  int comma = (p >= 0) ? r.indexOf(',', p) : -1;
+  if (p < 0 || comma < 0) return;
+  String n = r.substring(p + 5, comma); n.trim();
+  int v = n.toInt();
+  if (v == 99 || v < 0 || v > 31) return;
+  signalQuality = String(v);
+  signalPercent = (v * 100) / 31;
+}
+
+void checkRegistration() {
+  String r; networkRegistered = false; registrationStatus = "Unknown";
+  if (!sendAT("AT+CEREG?", 5000, &r)) return;
+  String line = lineAfter(r, "+CEREG:");
+  if (!line.length()) return;
+  int comma = line.indexOf(',');
+  String st = (comma >= 0) ? line.substring(comma + 1) : line;
+  int next = st.indexOf(',');
+  if (next >= 0) st = st.substring(0, next);
+  st.trim();
+  int v = st.toInt();
+  if (v == 1) { registrationStatus = "Home network"; networkRegistered = true; }
+  else if (v == 5) { registrationStatus = "Roaming"; networkRegistered = true; }
+  else if (v == 2) registrationStatus = "Searching";
+  else if (v == 3) registrationStatus = "Registration denied";
+  else if (v == 0) registrationStatus = "Not registered";
+  else registrationStatus = "Unknown (" + st + ")";
+}
+
+void checkPacketAttachment() {
+  String r; packetAttached = false;
+  if (sendAT("AT+CGATT?", 5000, &r)) packetAttached = (r.indexOf("+CGATT: 1") >= 0);
+}
+
+void checkModemIP() {
+  String r; modemIP = "Unavailable";
+  if (sendAT("AT+CGPADDR=1", 5000, &r)) {
+    String line = lineAfter(r, "+CGPADDR:");
+    int comma = line.indexOf(',');
+    if (comma >= 0) {
+      String ip = line.substring(comma + 1);
+      ip.replace("\"", ""); ip.trim();
+      if (isValidIP(ip)) modemIP = ip;
+    }
+  }
+}
+
+void updateCellularDiagnostics() {
+  checkSIM(); checkSignal(); checkRegistration(); checkPacketAttachment(); checkModemIP();
+  cellularConnected = simDetected && networkRegistered && packetAttached && isValidIP(modemIP);
+  Serial.println("CELLULAR: " + String(cellularConnected ? "AVAILABLE" : "NOT READY") +
+                 " | " + carrier + " | Signal " + String(signalPercent) + "% | " + registrationStatus);
+}
+
+// ============================================================
+// PDP BEARER
+// ============================================================
+bool ensureBearer(bool forceRebuild = false) {
+  String r;
+  if (forceRebuild || sawPdpDeact) {
+    Serial.println("Rebuilding AIR780E PDP bearer...");
+    sendAT("AT+HTTPTERM", 2500);
+    sendAT("AT+SAPBR=0,1", 8000);
+    delay(500);
+    sawPdpDeact = false; bearerActive = false;
+  } else if (sendAT("AT+SAPBR=2,1", 8000, &r)) {
+    String line = lineAfter(r, "+SAPBR:");
+    int c1 = line.indexOf(',');
+    int c2 = line.indexOf(',', c1 + 1);
+    if (c1 >= 0 && c2 >= 0) {
+      String state = line.substring(c1 + 1, c2); state.trim();
+      String ip = line.substring(c2 + 1); ip.replace("\"", ""); ip.trim();
+      if (state == "1" && isValidIP(ip)) { bearerActive = true; modemIP = ip; return true; }
+    }
+  }
+  if (!sendAT("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"", 5000, &r)) {
+    lastError = "SAPBR CONTYPE failed: " + r; return false;
+  }
+  if (!sendAT("AT+SAPBR=3,1,\"APN\",\"\"", 5000, &r)) {
+    lastError = "SAPBR APN failed: " + r; return false;
+  }
+  sendAT("AT+SAPBR=1,1", 30000, &r); // Query state even if activation response is unusual.
+  if (!sendAT("AT+SAPBR=2,1", 8000, &r)) { lastError = "SAPBR query failed"; bearerActive = false; return false; }
+  String line = lineAfter(r, "+SAPBR:");
+  int c1 = line.indexOf(',');
+  int c2 = line.indexOf(',', c1 + 1);
+  if (c1 >= 0 && c2 >= 0) {
+    String state = line.substring(c1 + 1, c2); state.trim();
+    String ip = line.substring(c2 + 1); ip.replace("\"", ""); ip.trim();
+    bearerActive = (state == "1" && isValidIP(ip));
+    if (bearerActive) modemIP = ip;
+  }
+  if (!bearerActive) lastError = "PDP bearer inactive or no SAPBR IP";
+  return bearerActive;
+}
+
+// ============================================================
+// AIR780E FIREBASE REQUEST
+// method: GET, PUT, POST
+// PUT uses POST + Firebase method-override query for AIR780E.
+// ============================================================
+bool cellularFirebaseRequest(const String& method, const String& url, const String& payload, String& responseBody) {
+  responseBody = "";
+  if (!cellularConnected) { lastError = "Cellular diagnostics not ready"; return false; }
+  if (!ensureBearer(false)) return false;
+
+  sendAT("AT+HTTPTERM", 2500);
+  delay(200);
+  if (!sendAT("AT+HTTPINIT", 12000)) { lastError = "HTTPINIT failed"; return false; }
+  String r;
+  if (!sendAT("AT+HTTPSSL=1", 10000, &r)) { lastError = "HTTPSSL failed: " + r; sendAT("AT+HTTPTERM", 2500); return false; }
+  // TEST MODE: TLS encryption is on, certificate verification is off.
+  sendAT("AT+SSLCFG=\"seclevel\",153,0", 5000);
+  if (!sendAT("AT+HTTPPARA=\"CID\",1", 5000)) { lastError = "HTTP CID setup failed"; sendAT("AT+HTTPTERM", 2500); return false; }
+
+  String requestURL = url;
+  bool hasBody = (method == "PUT" || method == "POST");
+  if (method == "PUT") requestURL += (requestURL.indexOf('?') >= 0 ? "&" : "?") + String("x-http-method-override=PUT");
+  if (!sendAT("AT+HTTPPARA=\"URL\",\"" + requestURL + "\"", 15000)) {
+    lastError = "HTTP URL setup failed"; sendAT("AT+HTTPTERM", 2500); return false;
+  }
+  if (!sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 5000)) {
+    lastError = "HTTP content type setup failed"; sendAT("AT+HTTPTERM", 2500); return false;
+  }
+
+  if (hasBody) {
+    String dataCmd = "AT+HTTPDATA=" + String(payload.length()) + ",20000";
+    Serial.println(">> " + dataCmd);
+    airSerial.println(dataCmd);
+    if (!waitForText("DOWNLOAD", 12000, r)) {
+      lastError = "HTTPDATA prompt failed: " + r; sendAT("AT+HTTPTERM", 2500); return false;
+    }
+    airSerial.print(payload);
+    if (!waitForText("OK", 25000, r)) {
+      lastError = "Modem rejected HTTP body: " + r; sendAT("AT+HTTPTERM", 2500); return false;
+    }
+  }
+
+  int action = (method == "GET") ? 0 : 1;
+  Serial.println(">> AT+HTTPACTION=" + String(action));
+  airSerial.println("AT+HTTPACTION=" + String(action));
+  int status = 0, bytes = 0;
+  String actionResponse;
+  if (!waitHTTPAction(status, bytes, actionResponse)) {
+    lastError = "HTTPACTION result timeout"; sendAT("AT+HTTPTERM", 2500); return false;
+  }
+  lastHTTPStatus = status;
+
+  String readResponse;
+  if (bytes > 0) {
+    sendAT("AT+HTTPREAD", 15000, &readResponse);
+    int header = readResponse.indexOf("+HTTPREAD:");
+    if (header >= 0) {
+      int bodyStart = readResponse.indexOf('\n', header);
+      if (bodyStart >= 0) {
+        bodyStart++;
+        int bodyEnd = readResponse.lastIndexOf("\r\nOK");
+        if (bodyEnd < bodyStart) bodyEnd = readResponse.lastIndexOf("\nOK");
+        if (bodyEnd > bodyStart) responseBody = readResponse.substring(bodyStart, bodyEnd);
+        else responseBody = readResponse.substring(bodyStart);
+      }
+    }
+  }
+  sendAT("AT+HTTPTERM", 3000);
+
+  Serial.println("AIR780E HTTP status: " + String(status));
+  if (status >= 200 && status < 300) { lastError = "None"; return true; }
+  lastError = "Cellular HTTP status " + String(status);
+  if (status == 601) lastError += " (network error)";
+  else if (status == 603) lastError += " (DNS error)";
+  else if (status == 605) lastError += " (TLS setup error)";
+  else if (status == 606) lastError += " (TLS communication error)";
+  return false;
+}
+
+// ============================================================
+// WIFI FIREBASE REQUEST
+// ============================================================
+bool wifiFirebaseRequest(const String& method, const String& url, const String& payload, String& responseBody) {
+  responseBody = "";
+  if (WiFi.status() != WL_CONNECTED) return false;
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure(); // Test mode; configure certificate validation for production.
+  HTTPClient http;
+  if (!http.begin(client, url)) { lastError = "WiFi HTTP begin failed"; return false; }
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000);
+  int code = -1;
+  if (method == "GET") code = http.GET();
+  else if (method == "PUT") code = http.PUT(payload);
+  else if (method == "POST") code = http.POST(payload);
+  if (code > 0) responseBody = http.getString();
+  else lastError = "WiFi request failed: " + http.errorToString(code);
+  http.end();
+  lastHTTPStatus = code;
+  if (code >= 200 && code < 300) { lastError = "None"; return true; }
+  if (code > 0) lastError = "WiFi HTTP status " + String(code) + ": " + responseBody;
+  return false;
+}
+
+// Every Firebase operation tries cellular first, then Wi-Fi backup.
+bool firebaseRequest(const String& method, const String& url, const String& payload, String& responseBody) {
+  if (cellularConnected) {
+    activeConnection = "Cellular";
+    if (cellularFirebaseRequest(method, url, payload, responseBody)) return true;
+    Serial.println("Cellular Firebase request failed; trying Wi-Fi backup. " + lastError);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    uint32_t started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 12000UL) {
+      wifiMulti.run(); handleWebServer(); delay(10); yield();
+    }
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    activeConnection = "WiFi";
+    if (wifiFirebaseRequest(method, url, payload, responseBody)) return true;
+  }
+  return false;
+}
+
+// ============================================================
+// WIFI BACKUP MANAGEMENT
+// ============================================================
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - previousWifiRetry < wifiRetryInterval) return;
+  previousWifiRetry = millis();
+  Serial.println("Checking Wi-Fi backup networks...");
+  wifiMulti.run();
+}
+
+// ============================================================
+// TIME HELPERS
+// ============================================================
+bool timeIsValid() { return time(nullptr) > 100000; }
+
+String getDate() {
+  if (!timeIsValid()) return "Time unavailable";
+  time_t now = time(nullptr); struct tm timeinfo; localtime_r(&now, &timeinfo);
+  char buffer[30]; strftime(buffer, sizeof(buffer), "%B %d, %Y", &timeinfo);
+  return String(buffer);
+}
+
+String getTime() {
+  if (!timeIsValid()) return "Time unavailable";
+  time_t now = time(nullptr); struct tm timeinfo; localtime_r(&now, &timeinfo);
+  char buffer[20]; strftime(buffer, sizeof(buffer), "%I:%M:%S %p", &timeinfo);
+  return String(buffer);
+}
+
+unsigned long getTimestamp() {
+  if (!timeIsValid()) return 0;
+  return (unsigned long)time(nullptr);
+}
+
+void syncTimeIfWiFiAvailable() {
+  if (WiFi.status() != WL_CONNECTED || timeIsValid()) return;
+  configTime(28800, 0, "pool.ntp.org", "time.google.com");
+  uint32_t start = millis();
+  while (!timeIsValid() && millis() - start < 12000UL) { delay(250); yield(); }
+  Serial.println(timeIsValid() ? "Time synchronized." : "NTP time unavailable; timestamp will be 0 until synced.");
+}
+
+// ============================================================
+// BATTERY MONITORING
+// ============================================================
+float readBatteryVoltage() {
+  long total = 0;
+  for (int i = 0; i < 20; i++) { total += analogRead(BATTERY_PIN); delay(5); }
+  float raw = total / 20.0;
+  float adcVoltage = raw * (ADC_FULL_SCALE / 1023.0);
+  return adcVoltage * DIVIDER_RATIO;
+}
+
+int calculateBatteryPercentage(float voltage) {
+  if (voltage >= 4.20) return 100;
+  if (voltage >= 4.10) return 90;
+  if (voltage >= 4.00) return 80;
+  if (voltage >= 3.90) return 60;
+  if (voltage >= 3.80) return 40;
+  if (voltage >= 3.70) return 20;
+  if (voltage >= 3.50) return 5;
+  return 0;
+}
+
+void updateChargingStatus(float voltage) {
+  if (previousBatteryVoltage == 0) {
+    previousBatteryVoltage = voltage; chargingStatus = "Checking"; previousTrendCheck = millis(); return;
+  }
+  if (millis() - previousTrendCheck >= trendCheckInterval) {
+    voltageTrend = voltage - previousBatteryVoltage;
+    if (voltageTrend > 0.02) chargingStatus = "Probably Charging";
+    else if (voltageTrend < -0.02) chargingStatus = "Discharging";
+    else chargingStatus = "Stable";
+    previousBatteryVoltage = voltage;
+    previousTrendCheck = millis();
+  }
+}
+
+void uploadBatteryData() {
+  batteryVoltage = readBatteryVoltage();
+  batteryPercentage = calculateBatteryPercentage(batteryVoltage);
+  updateChargingStatus(batteryVoltage);
+  String json = "{";
+  json += "\"voltage\":" + String(batteryVoltage, 2) + ",";
+  json += "\"percentage\":" + String(batteryPercentage) + ",";
+  json += "\"charging_status\":\"" + jsonEscape(chargingStatus) + "\",";
+  json += "\"charging_trend\":" + String(voltageTrend, 3) + ",";
+  json += "\"last_updated\":" + String(getTimestamp());
+  json += "}";
+  String response;
+  Serial.println("\n========== BATTERY UPLOAD ==========");
+  Serial.println("Voltage: " + String(batteryVoltage, 2) + " V | " + String(batteryPercentage) + "% | " + chargingStatus);
+  bool ok = firebaseRequest("PUT", batteryURL, json, response);
+  Serial.println(ok ? "Battery Firebase upload SUCCESS" : "Battery Firebase upload FAILED: " + lastError);
+}
+
+// ============================================================
+// SENSOR SETTINGS
+// ============================================================
+float getSetting(String json, String key, float fallback) {
+  String searchKey = "\"" + key + "\"";
+  int keyPosition = json.indexOf(searchKey);
+  if (keyPosition < 0) return fallback;
+  int colonPosition = json.indexOf(":", keyPosition);
+  if (colonPosition < 0) return fallback;
+  int start = colonPosition + 1;
+  while (start < (int)json.length() && (json[start] == ' ' || json[start] == '\n' || json[start] == '\r')) start++;
+  int end = start;
+  while (end < (int)json.length() && json[end] != ',' && json[end] != '}') end++;
+  String value = json.substring(start, end); value.trim();
+  if (!value.length() || value == "null") return fallback;
+  return value.toFloat();
+}
+
+void fetchSensorSettings() {
+  String json;
+  Serial.println("\nFetching Firebase sensor settings...");
+  if (!firebaseRequest("GET", settingsURL, "", json)) {
+    Serial.println("Settings fetch failed: " + lastError);
+    return;
+  }
+  Serial.println("Settings JSON: " + json);
+  float newHeight = getSetting(json, "tube_height_cm", SENSOR_HEIGHT);
+  float newLight = getSetting(json, "light_flooding_cm", LIGHT_FLOODING_LEVEL);
+  float newFlood = getSetting(json, "flooding_cm", FLOODING_LEVEL);
+  float newHeavy = getSetting(json, "heavy_flooding_cm", HEAVY_FLOODING_LEVEL);
+  if (newHeight > newHeavy && newHeavy > newFlood && newFlood > newLight && newLight > 0) {
+    SENSOR_HEIGHT = newHeight;
+    LIGHT_FLOODING_LEVEL = newLight;
+    FLOODING_LEVEL = newFlood;
+    HEAVY_FLOODING_LEVEL = newHeavy;
+    Serial.println("Sensor settings updated from Firebase.");
+  } else {
+    Serial.println("Settings missing/invalid; keeping current values.");
+  }
+  Serial.println("Tube=" + String(SENSOR_HEIGHT) + " cm | Light=" + String(LIGHT_FLOODING_LEVEL) +
+                 " cm | Flood=" + String(FLOODING_LEVEL) + " cm | Heavy=" + String(HEAVY_FLOODING_LEVEL) + " cm");
+}
+
+// ============================================================
+// SENSOR READING AND FLOOD CLASSIFICATION
+// ============================================================
+bool readSensor() {
+  digitalWrite(TRIG, LOW); delayMicroseconds(5);
+  digitalWrite(TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  unsigned long duration = pulseIn(ECHO, HIGH, 35000);
+  if (duration == 0) { Serial.println("Sensor Timeout!"); return false; }
+  float newDistance = duration * 0.0343 / 2.0;
+  if (newDistance <= 2 || newDistance > SENSOR_HEIGHT) { Serial.println("Invalid Sensor Reading!"); return false; }
+  distance = newDistance;
+  waterHeight = SENSOR_HEIGHT - distance;
+  Serial.println("\n========== SENSOR ==========");
+  Serial.println("Distance: " + String(distance, 2) + " cm");
+  Serial.println("Water Level: " + String(waterHeight, 2) + " cm");
+  return true;
+}
+
+void classifyFlood() {
+  if (waterHeight < LIGHT_FLOODING_LEVEL) floodType = "No Flood";
+  else if (waterHeight < FLOODING_LEVEL) floodType = "Light Flooding";
+  else if (waterHeight < HEAVY_FLOODING_LEVEL) floodType = "Flooding";
+  else floodType = "Heavy Flooding";
+  Serial.println("Flood Type: " + floodType);
+}
+
+// ============================================================
+// FIREBASE SENSOR CURRENT + HISTORY UPLOAD
+// ============================================================
+void uploadFirebase() {
+  String currentJSON = "{";
+  currentJSON += "\"date\":\"" + jsonEscape(getDate()) + "\",";
+  currentJSON += "\"time\":\"" + jsonEscape(getTime()) + "\",";
+  currentJSON += "\"timestamp\":" + String(getTimestamp()) + ",";
+  currentJSON += "\"flood_type\":\"" + jsonEscape(floodType) + "\",";
+  currentJSON += "\"location\":\"" + jsonEscape(location) + "\",";
+  currentJSON += "\"water_level\":" + String(waterHeight, 2);
+  currentJSON += "}";
+
+  String response;
+  Serial.println("\n========== CURRENT SENSOR UPLOAD ==========");
+  Serial.println(currentJSON);
+  bool currentOK = firebaseRequest("PUT", currentURL, currentJSON, response);
+  Serial.println(currentOK ? "Current sensor data UPDATED." : "Current sensor upload FAILED: " + lastError);
+
+  yield();
+
+  String historyJSON = "{";
+  historyJSON += "\"sensor_id\":\"" + String(sensorID) + "\",";
+  historyJSON += "\"date\":\"" + jsonEscape(getDate()) + "\",";
+  historyJSON += "\"time\":\"" + jsonEscape(getTime()) + "\",";
+  historyJSON += "\"timestamp\":" + String(getTimestamp()) + ",";
+  historyJSON += "\"water_level\":" + String(waterHeight, 2);
+  historyJSON += "}";
+  Serial.println("Uploading water-level history...");
+  bool historyOK = firebaseRequest("POST", historyURL, historyJSON, response);
+  Serial.println(historyOK ? "History saved." : "History upload FAILED: " + lastError);
+
+  bool overall = currentOK && historyOK;
+  firebaseConnected = overall;
+  if (overall) {
+    lastUpload = "SUCCESS - " + activeConnection;
+    lastError = "None";
+  } else {
+    lastUpload = "PARTIAL/FAILED - " + activeConnection;
+  }
+  uploadCounter++;
+}
+
+// ============================================================
+// LOCAL WEB DASHBOARD
+// ============================================================
+void handleWebServer() {
+  WiFiClient c = server.available();
+  if (!c) return;
+  unsigned long started = millis();
+  while (c.connected() && !c.available() && millis() - started < 1500) { delay(1); yield(); }
+  if (!c.available()) { c.stop(); return; }
+  c.readStringUntil('\r');
+  c.println("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n");
+  c.println("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='3'><title>FloodWatch</title></head>");
+  c.println("<body style='font-family:Arial;background:#0B0F5B;color:white;padding:16px'>");
+  c.println("<h2>FloodWatch Sensor Dashboard</h2>");
+  c.println("<p><b>Sensor:</b> " + String(sensorID) + "</p>");
+  c.println("<p><b>Distance:</b> " + String(distance, 2) + " cm</p>");
+  c.println("<p><b>Water level:</b> " + String(waterHeight, 2) + " cm</p>");
+  c.println("<p><b>Flood type:</b> " + floodType + "</p><hr>");
+  c.println("<h3>Battery</h3><p>Voltage: " + String(batteryVoltage, 2) + " V</p>");
+  c.println("<p>Battery: " + String(batteryPercentage) + "%</p><p>Charging: " + chargingStatus + "</p><hr>");
+  c.println("<h3>Cellular / SIM</h3><p>Carrier: " + carrier + "</p>");
+  c.println("<p>SIM: " + String(simDetected ? "DETECTED" : "NOT READY") + "</p>");
+  c.println("<p>Signal: " + signalQuality + " (~" + String(signalPercent) + "%)</p>");
+  c.println("<p>LTE: " + registrationStatus + "</p><p>Packet attached: " + String(packetAttached ? "YES" : "NO") + "</p>");
+  c.println("<p>Modem IP: " + modemIP + "</p><p>PDP bearer: " + String(bearerActive ? "ACTIVE" : "INACTIVE") + "</p>");
+  c.println("<p>Cellular: " + String(cellularConnected ? "AVAILABLE" : "UNAVAILABLE") + "</p><hr>");
+  c.println("<h3>Wi-Fi Backup</h3><p>Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED") + "</p>");
+  if (WiFi.status() == WL_CONNECTED) c.println("<p>Connected Wi-Fi: " + WiFi.SSID() + "</p>");
+  c.println("<p>Active connection: " + activeConnection + "</p><p>Firebase: " + String(firebaseConnected ? "SUCCESS" : "NOT CONFIRMED") + "</p>");
+  c.println("<p>Last upload: " + lastUpload + "</p><p>HTTP status: " + String(lastHTTPStatus) + "</p>");
+  c.println("<p>Last error: " + lastError + "</p><p>Last modem URC: " + lastModemURC + "</p><hr>");
+  c.println("<h3>Sensor Configuration</h3><p>Tube height: " + String(SENSOR_HEIGHT) + " cm</p>");
+  c.println("<p>Light flooding: " + String(LIGHT_FLOODING_LEVEL) + " cm</p><p>Flooding: " + String(FLOODING_LEVEL) + " cm</p>");
+  c.println("<p>Heavy flooding: " + String(HEAVY_FLOODING_LEVEL) + " cm</p>");
+  c.println("<p>Uptime: " + String(millis() / 1000) + " seconds</p>");
+  c.println("</body></html>");
+  c.stop();
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  airSerial.begin(MODEM_BAUD);
+  delay(1200);
+
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+  pinMode(BATTERY_PIN, INPUT);
+  digitalWrite(TRIG, LOW);
+
+  Serial.println("\n============================================");
+  Serial.println(" FLOODWATCH - ABSOLUTE FINAL SENSOR CODE");
+  Serial.println(" Cellular primary | Dual Wi-Fi backup");
+  Serial.println("============================================");
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.softAP(AP_NAME, AP_PASSWORD);
+  server.begin();
+  Serial.println("Dashboard AP: " + String(AP_NAME));
+  Serial.println("Dashboard IP: " + WiFi.softAPIP().toString());
+
+  wifiMulti.addAP(WIFI_SSID_1, WIFI_PASSWORD_1);
+  wifiMulti.addAP(WIFI_SSID_2, WIFI_PASSWORD_2);
+  Serial.println("Wi-Fi backup networks registered:");
+  Serial.println("1. " + String(WIFI_SSID_1));
+  Serial.println("2. " + String(WIFI_SSID_2));
+  wifiMulti.run();
+
+  bool modemReady = false;
+  for (int i = 0; i < 10; i++) {
+    if (sendAT("AT", 2500)) { modemReady = true; break; }
+    delay(800);
+  }
+  if (modemReady) {
+    Serial.println("AIR780E RESPONDING");
+    sendAT("ATE0", 4000);
+    sendAT("AT+CMEE=2", 4000);
+    sendAT("AT+CEREG=2", 4000);
+    updateCellularDiagnostics();
+  } else {
+    lastError = "AIR780E not responding at 9600 baud";
+    Serial.println(lastError);
+  }
+
+  // NTP uses Wi-Fi if available. Cellular-only operation can still upload,
+  // but timestamps remain 0 until the ESP8266 obtains valid time.
+  syncTimeIfWiFiAvailable();
+
+  fetchSensorSettings();
+  previousSettingsFetch = millis();
+
+  batteryVoltage = readBatteryVoltage();
+  batteryPercentage = calculateBatteryPercentage(batteryVoltage);
+  previousBatteryVoltage = batteryVoltage;
+  previousTrendCheck = millis();
+
+  previousModemCheck = millis();
+  previousUpload = millis();
+  previousSensorRead = millis();
+  previousBatteryUpload = millis();
+
+  Serial.println("System ready. Sensor ID: " + String(sensorID));
+  Serial.println("Upload interval: 2 seconds | Settings: 10 seconds | Battery: 5 seconds");
+  Serial.println("Dashboard: connect to FloodWatch-Diagnostics, then open 192.168.4.1");
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+void loop() {
+  handleWebServer();
+  connectWiFi();
+  syncTimeIfWiFiAvailable();
+
+  // Refresh modem status periodically rather than before every reading.
+  if (millis() - previousModemCheck >= modemCheckInterval) {
+    previousModemCheck = millis();
+    updateCellularDiagnostics();
+  }
+
+  if (millis() - previousSensorRead >= sensorInterval) {
+    previousSensorRead = millis();
+    sensorValid = readSensor();
+    if (sensorValid) classifyFlood();
+  }
+
+  if (millis() - previousSettingsFetch >= settingsFetchInterval) {
+    previousSettingsFetch = millis();
+    fetchSensorSettings();
+  }
+
+  if (millis() - previousUpload >= uploadInterval) {
+    previousUpload = millis();
+    if (sensorValid) uploadFirebase();
+    else Serial.println("Water upload skipped: invalid sensor reading.");
+  }
+
+  if (millis() - previousBatteryUpload >= batteryUploadInterval) {
+    previousBatteryUpload = millis();
+    uploadBatteryData();
+  }
+
+  yield();
+}
+
+add that and rename the sketch to absolute ultimate unstopabble floodwatch sensor code  make it downlodable again cuz im wondering oyu cut the code to 800 lines very efficent
